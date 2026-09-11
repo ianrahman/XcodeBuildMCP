@@ -7,8 +7,10 @@ import {
   isXcodeBuildMCPManagedTestProductsName,
 } from './test-products-path.ts';
 
-export const TEST_PRODUCTS_MAX_AGE_MS = 3 * 24 * 60 * 60 * 1000;
-export const TEST_PRODUCTS_MAX_COUNT = 100;
+export const TEST_PRODUCTS_DAY_MS = 24 * 60 * 60 * 1000;
+export const TEST_PRODUCTS_MAX_AGE_DAYS = 1;
+export const TEST_PRODUCTS_MAX_AGE_MS = TEST_PRODUCTS_MAX_AGE_DAYS * TEST_PRODUCTS_DAY_MS;
+export const TEST_PRODUCTS_MAX_COUNT = 3;
 
 interface RetainedTestProducts {
   path: string;

@@ -15,7 +15,13 @@ import { getRuntimeInstance, getRuntimeInstanceIfConfigured } from './runtime-in
 import { tryAcquireFsLock, type AcquiredFsLock } from './fs-lock.ts';
 import { isPidAlive } from './process-liveness.ts';
 import { getResultBundleCompletionMarkerPath } from './result-bundle-path.ts';
-import { pruneManagedTestProductsDirectory } from './test-products-lifecycle.ts';
+import { getConfig } from './config-store.ts';
+import {
+  pruneManagedTestProductsDirectory,
+  TEST_PRODUCTS_DAY_MS,
+  TEST_PRODUCTS_MAX_AGE_DAYS,
+  TEST_PRODUCTS_MAX_COUNT,
+} from './test-products-lifecycle.ts';
 
 export const WORKSPACE_FILESYSTEM_LIFECYCLE_LOG_MAX_AGE_MS = 3 * 24 * 60 * 60 * 1000;
 export const WORKSPACE_FILESYSTEM_LIFECYCLE_LOG_MAX_FILES = 10_000;
@@ -63,6 +69,8 @@ export interface WorkspaceFilesystemLifecycleOptions {
   now?: number;
   maxAgeMs?: number;
   maxFiles?: number;
+  testProductsMaxAgeMs?: number;
+  testProductsMaxCount?: number;
   cooldownMs?: number;
   force?: boolean;
   minVisibleMs?: number;
@@ -100,6 +108,8 @@ interface ResolvedWorkspaceFilesystemLifecycleOptions {
   now: number;
   maxAgeMs: number;
   maxFiles: number;
+  testProductsMaxAgeMs: number;
+  testProductsMaxCount: number;
   cooldownMs: number;
   force: boolean;
   minVisibleMs: number;
@@ -159,6 +169,7 @@ function resolveOptions(
   const workspaceKey = resolveWorkspaceKey(options);
   const layout = options.logDir ? null : getWorkspaceFilesystemLayout(workspaceKey);
   const logDir = options.logDir ?? layout?.logs;
+  const config = getConfig();
   if (!logDir) {
     throw new Error('Workspace filesystem lifecycle requires a log directory');
   }
@@ -180,6 +191,11 @@ function resolveOptions(
     now: options.now ?? Date.now(),
     maxAgeMs: options.maxAgeMs ?? WORKSPACE_FILESYSTEM_LIFECYCLE_LOG_MAX_AGE_MS,
     maxFiles: options.maxFiles ?? WORKSPACE_FILESYSTEM_LIFECYCLE_LOG_MAX_FILES,
+    testProductsMaxAgeMs:
+      options.testProductsMaxAgeMs ??
+      (config.testProductsMaxAgeDays ?? TEST_PRODUCTS_MAX_AGE_DAYS) * TEST_PRODUCTS_DAY_MS,
+    testProductsMaxCount:
+      options.testProductsMaxCount ?? config.testProductsMaxCount ?? TEST_PRODUCTS_MAX_COUNT,
     cooldownMs: options.cooldownMs ?? WORKSPACE_FILESYSTEM_LIFECYCLE_COOLDOWN_MS,
     force: options.force ?? false,
     minVisibleMs: options.minVisibleMs ?? WORKSPACE_FILESYSTEM_LIFECYCLE_MIN_VISIBLE_MS,
@@ -643,7 +659,8 @@ export async function runWorkspaceFilesystemLifecycleSweep(
           testProductsDir: resolved.testProductsDir,
           now: resolved.now,
           minVisibleMs: resolved.minVisibleMs,
-          maxAgeMs: resolved.maxAgeMs,
+          maxAgeMs: resolved.testProductsMaxAgeMs,
+          maxCount: resolved.testProductsMaxCount,
         })
       : { scanned: 0, deleted: 0 };
     await touchCleanupMarker(resolved.markerPath, resolved.now);

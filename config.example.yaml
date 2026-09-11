@@ -8,6 +8,8 @@ customWorkflows:
 experimentalWorkflowDiscovery: false
 disableSessionDefaults: false
 incrementalBuildsEnabled: false
+testProductsMaxCount: 3 # managed paths only; caller-provided paths are never pruned
+testProductsMaxAgeDays: 1
 debug: false
 sentryDisabled: false
 filePathRenderStyle: 'list' # text output file artifacts: list or tree

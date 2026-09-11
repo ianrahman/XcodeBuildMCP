@@ -40,7 +40,7 @@ describe('test products lifecycle', () => {
     await rm(root, { recursive: true, force: true });
   });
 
-  it('prunes managed products after three days while preserving caller-owned paths', async () => {
+  it('prunes managed products after the default retention age while preserving caller-owned paths', async () => {
     const now = Date.UTC(2026, 4, 6, 12);
     const oldManaged = path.join(root, managedName('old'));
     const recentManaged = path.join(root, managedName('recent'));
@@ -50,7 +50,7 @@ describe('test products lifecycle', () => {
       `${path.basename(root)}-external-caller.xctestproducts`,
     );
     writeTestProducts(oldManaged, now - TEST_PRODUCTS_MAX_AGE_MS - 1, true);
-    writeTestProducts(recentManaged, now - 2 * DAY_MS, true);
+    writeTestProducts(recentManaged, now - TEST_PRODUCTS_MAX_AGE_MS / 2, true);
     writeTestProducts(callerOwned, now - 10 * DAY_MS, true);
     writeTestProducts(externalCallerOwned, now - 10 * DAY_MS, true);
 

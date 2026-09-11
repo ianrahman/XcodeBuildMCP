@@ -278,6 +278,21 @@ describe('project-config', () => {
       }
     });
 
+    it('should reject negative test-products retention limits', async () => {
+      const yaml = [
+        'schemaVersion: 1',
+        'testProductsMaxCount: -1',
+        'testProductsMaxAgeDays: -1',
+        '',
+      ].join('\n');
+      const { fs } = createFsFixture({ exists: true, readFile: yaml });
+
+      const result = await loadProjectConfig({ fs, cwd });
+
+      expect(result.found).toBe(false);
+      expect('error' in result).toBe(true);
+    });
+
     it('should return an error result when YAML does not parse to an object', async () => {
       const { fs } = createFsFixture({ exists: true, readFile: '- item' });
 

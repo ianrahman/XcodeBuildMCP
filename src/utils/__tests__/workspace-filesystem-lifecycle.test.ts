@@ -5,6 +5,8 @@ import { existsSync, mkdirSync, mkdtempSync, writeFileSync, utimesSync } from 'n
 import { rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
+import { writeDaemonRegistryEntry } from '../../daemon/daemon-registry.ts';
+import { createMockFileSystemExecutor } from '../../test-utils/mock-executors.ts';
 import {
   cleanupOwnedWorkspaceFilesystemArtifacts,
   getManagedResultBundleOwnerPid,
@@ -23,13 +25,13 @@ import {
 import { getResultBundleCompletionMarkerPath } from '../result-bundle-path.ts';
 import { getTestProductsCompletionMarkerPath } from '../test-products-path.ts';
 import { TEST_PRODUCTS_MAX_COUNT } from '../test-products-lifecycle.ts';
-import { writeDaemonRegistryEntry } from '../../daemon/daemon-registry.ts';
 import { setRuntimeInstanceForTests } from '../runtime-instance.ts';
 import {
   clearAllSimulatorLaunchOsLogSessionsForTests,
   registerSimulatorLaunchOsLogSession,
 } from '../log-capture/simulator-launch-oslog-sessions.ts';
 import { setSimulatorLaunchOsLogRecordActiveOverrideForTests } from '../log-capture/simulator-launch-oslog-registry.ts';
+import { __resetConfigStoreForTests, initConfigStore } from '../config-store.ts';
 
 let appDir: string;
 const DEAD_OWNER_PID = 999_999_999;
@@ -87,6 +89,7 @@ describe('workspace filesystem lifecycle', () => {
       pid: process.pid,
       workspaceKey: 'workspace-a',
     });
+    __resetConfigStoreForTests();
     resetWorkspaceFilesystemLifecycleStateForTests();
   });
 
@@ -95,6 +98,7 @@ describe('workspace filesystem lifecycle', () => {
     setSimulatorLaunchOsLogRecordActiveOverrideForTests(null);
     await clearAllSimulatorLaunchOsLogSessionsForTests();
     setRuntimeInstanceForTests(null);
+    __resetConfigStoreForTests();
     setXcodeBuildMCPAppDirOverrideForTests(null);
     await rm(appDir, { recursive: true, force: true });
   });
@@ -368,6 +372,47 @@ describe('workspace filesystem lifecycle', () => {
     expect(existsSync(products[0]!)).toBe(false);
     expect(existsSync(products.at(-1)!)).toBe(true);
     expect(existsSync(getTestProductsCompletionMarkerPath(products[0]!))).toBe(false);
+  });
+
+  it('applies configured age and count limits to managed test products', async () => {
+    const now = Date.UTC(2026, 4, 2, 12);
+    const configPath = path.join('/repo', '.xcodebuildmcp', 'config.yaml');
+    await initConfigStore({
+      cwd: '/repo',
+      fs: createMockFileSystemExecutor({
+        existsSync: (targetPath) => targetPath === configPath,
+        readFile: async () =>
+          [
+            'schemaVersion: 1',
+            'testProductsMaxCount: 1',
+            'testProductsMaxAgeDays: 1',
+            '',
+          ].join('\n'),
+      }),
+    });
+    const layout = getWorkspaceFilesystemLayout('workspace-a');
+    const oldest = path.join(layout.testProducts, managedTestProductsName('test_oldest'));
+    const middle = path.join(layout.testProducts, managedTestProductsName('test_middle'));
+    const newest = path.join(layout.testProducts, managedTestProductsName('test_newest'));
+    writeTestProductsWithMtime(oldest, now - 2 * 24 * 60 * 60 * 1000);
+    writeTestProductsWithMtime(middle, now - 2 * 60 * 60 * 1000);
+    writeTestProductsWithMtime(newest, now - 60 * 60 * 1000);
+    for (const productsPath of [oldest, middle, newest]) {
+      writeFileSync(getTestProductsCompletionMarkerPath(productsPath), 'completed');
+    }
+
+    const result = await runWorkspaceFilesystemLifecycleSweep({
+      workspaceKey: 'workspace-a',
+      trigger: 'manual',
+      now,
+      force: true,
+      minVisibleMs: 0,
+    });
+
+    expect(result).toMatchObject({ scanned: 3, deleted: 2 });
+    expect(existsSync(oldest)).toBe(false);
+    expect(existsSync(middle)).toBe(false);
+    expect(existsSync(newest)).toBe(true);
   });
 
   it('protects live managed result bundles until their completion marker exists', async () => {

@@ -11,6 +11,10 @@ import type { DebuggerBackendKind } from './debugger/types.ts';
 import type { FilePathRenderStyle, UiDebuggerGuardMode } from './runtime-config-types.ts';
 import { isFilePathRenderStyle } from './file-path-render-style.ts';
 import { normalizeSessionDefaultsProfileName } from './session-defaults-profile.ts';
+import {
+  TEST_PRODUCTS_MAX_AGE_DAYS,
+  TEST_PRODUCTS_MAX_COUNT,
+} from './test-products-lifecycle.ts';
 
 export type RuntimeConfigOverrides = Partial<{
   enabledWorkflows: string[];
@@ -24,6 +28,8 @@ export type RuntimeConfigOverrides = Partial<{
   filePathRenderStyle: FilePathRenderStyle;
   uiDebuggerGuardMode: UiDebuggerGuardMode;
   incrementalBuildsEnabled: boolean;
+  testProductsMaxCount: number;
+  testProductsMaxAgeDays: number;
   dapRequestTimeoutMs: number;
   dapLogEvents: boolean;
   launchJsonWaitMs: number;
@@ -51,6 +57,8 @@ export type ResolvedRuntimeConfig = {
   filePathRenderStyle?: FilePathRenderStyle;
   uiDebuggerGuardMode: UiDebuggerGuardMode;
   incrementalBuildsEnabled: boolean;
+  testProductsMaxCount?: number;
+  testProductsMaxAgeDays?: number;
   dapRequestTimeoutMs: number;
   dapLogEvents: boolean;
   launchJsonWaitMs: number;
@@ -87,6 +95,8 @@ const DEFAULT_CONFIG: ResolvedRuntimeConfig = {
   showTestTiming: false,
   uiDebuggerGuardMode: 'error',
   incrementalBuildsEnabled: false,
+  testProductsMaxCount: TEST_PRODUCTS_MAX_COUNT,
+  testProductsMaxAgeDays: TEST_PRODUCTS_MAX_AGE_DAYS,
   dapRequestTimeoutMs: 30_000,
   dapLogEvents: false,
   launchJsonWaitMs: 8000,
@@ -126,6 +136,13 @@ function parseNonNegativeInt(value: string | undefined): number | undefined {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < 0) return undefined;
   return Math.floor(parsed);
+}
+
+function parseNonNegativeNumber(value: string | undefined): number | undefined {
+  if (!value) return undefined;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return undefined;
+  return parsed;
 }
 
 function parseEnabledWorkflows(value: string | undefined): string[] | undefined {
@@ -225,6 +242,18 @@ function readEnvConfig(env: NodeJS.ProcessEnv): RuntimeConfigOverrides {
   );
 
   setIfDefined(config, 'incrementalBuildsEnabled', parseBoolean(env.INCREMENTAL_BUILDS_ENABLED));
+
+  setIfDefined(
+    config,
+    'testProductsMaxCount',
+    parseNonNegativeInt(env.XCODEBUILDMCP_TEST_PRODUCTS_MAX_COUNT),
+  );
+
+  setIfDefined(
+    config,
+    'testProductsMaxAgeDays',
+    parseNonNegativeNumber(env.XCODEBUILDMCP_TEST_PRODUCTS_MAX_AGE_DAYS),
+  );
 
   const axePath = env.XCODEBUILDMCP_AXE_PATH ?? env.AXE_PATH;
   if (axePath) config.axePath = axePath;
@@ -534,6 +563,20 @@ function resolveConfig(opts: {
       fileConfig: opts.fileConfig,
       envConfig,
       fallback: DEFAULT_CONFIG.incrementalBuildsEnabled,
+    }),
+    testProductsMaxCount: resolveFromLayers({
+      key: 'testProductsMaxCount',
+      overrides: opts.overrides,
+      fileConfig: opts.fileConfig,
+      envConfig,
+      fallback: DEFAULT_CONFIG.testProductsMaxCount,
+    }),
+    testProductsMaxAgeDays: resolveFromLayers({
+      key: 'testProductsMaxAgeDays',
+      overrides: opts.overrides,
+      fileConfig: opts.fileConfig,
+      envConfig,
+      fallback: DEFAULT_CONFIG.testProductsMaxAgeDays,
     }),
     dapRequestTimeoutMs: resolveFromLayers({
       key: 'dapRequestTimeoutMs',

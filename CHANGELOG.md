@@ -6,6 +6,10 @@
 
 - Dictionary-shaped MCP inputs now use client-compatible wire representations ([#491](https://github.com/getsentry/XcodeBuildMCP/issues/491)). The `env` and `testRunnerEnv` inputs on build, launch, test, and session-default tools are arrays of `{ "key": "...", "value": "..." }` entries, while `xcode_ide_call_tool.arguments` is a JSON object string. XcodeBuildMCP converts these values to their existing internal objects only after MCP input validation.
 
+### Fixed
+
+- Reduced managed test-product retention to three bundles for one day and added `testProductsMaxCount` and `testProductsMaxAgeDays` project configuration, with matching environment overrides, to substantially reduce disk growth from repeated test runs ([#524](https://github.com/getsentry/XcodeBuildMCP/issues/524)).
+
 ## [2.7.0]
 
 ### New! Xcode 27 Device Hub simulator support
