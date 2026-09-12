@@ -11,6 +11,17 @@ import {
   callHandler,
 } from '../../../../test-utils/test-helpers.ts';
 import { sessionStore } from '../../../../utils/session-store.ts';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import * as path from 'node:path';
+import { setXcodeBuildMCPAppDirOverrideForTests } from '../../../../utils/log-paths.ts';
+import { getTestProductsCompletionMarkerPath } from '../../../../utils/test-products-path.ts';
 
 import { schema, handler, build_simLogic, buildSimulatorSchema } from '../build_sim.ts';
 
@@ -413,6 +424,10 @@ describe('build_sim tool', () => {
     it('should prepare reusable simulator test products', async () => {
       const callHistory: Array<{ command: string[]; logPrefix?: string }> = [];
       const testProductsPath = '/tmp/MyApp Tests.xctestproducts';
+      const pinnedTestProductsPath = path.join(
+        realpathSync('/tmp'),
+        path.basename(testProductsPath),
+      );
 
       const { result } = await runBuildSimLogic(
         {
@@ -428,7 +443,7 @@ describe('build_sim tool', () => {
       expect(callHistory).toHaveLength(2);
       expect(callHistory[1].command.slice(-3)).toEqual([
         '-testProductsPath',
-        testProductsPath,
+        pinnedTestProductsPath,
         'build-for-testing',
       ]);
       expect(callHistory[1].logPrefix).toBe('iOS Simulator Build for Testing');
@@ -575,6 +590,10 @@ describe('build_sim tool', () => {
     it('should suggest running prepared simulator tests after success', async () => {
       const mockExecutor = createMockExecutor({ success: true, output: 'BUILD SUCCEEDED' });
       const testProductsPath = '/tmp/MyApp Tests.xctestproducts';
+      const pinnedTestProductsPath = path.join(
+        realpathSync('/tmp'),
+        path.basename(testProductsPath),
+      );
 
       const { result } = await runBuildSimLogic(
         {
@@ -588,9 +607,45 @@ describe('build_sim tool', () => {
       );
 
       expect(result.nextStepParams).toEqual({
-        test_sim: { testProductsPath, simulatorName: 'iPhone 17' },
+        test_sim: {
+          testProductsPath: pinnedTestProductsPath,
+          simulatorName: 'iPhone 17',
+        },
       });
       expect(result.nextStepConditionKeys).toEqual(['prepared_tests_available']);
+    });
+
+    it('should finalize generated test products when xcodebuild infrastructure throws', async () => {
+      const appDir = mkdtempSync(path.join(tmpdir(), 'xcodebuildmcp-build-sim-products-'));
+      setXcodeBuildMCPAppDirOverrideForTests(appDir);
+      let testProductsPath: string | undefined;
+      try {
+        const executor = async (command: string[]) => {
+          if (command[0] === 'xcrun') {
+            return createMockCommandResponse({ success: false, output: '' });
+          }
+          const index = command.indexOf('-testProductsPath');
+          testProductsPath = command[index + 1];
+          mkdirSync(testProductsPath!);
+          throw new Error('spawn failed');
+        };
+
+        const { result } = await runBuildSimLogic(
+          {
+            workspacePath: '/path/to/workspace',
+            scheme: 'MyScheme',
+            simulatorName: 'iPhone 17',
+            buildForTesting: true,
+          },
+          executor,
+        );
+
+        expect(result.isError()).toBe(true);
+        expect(existsSync(getTestProductsCompletionMarkerPath(testProductsPath!))).toBe(true);
+      } finally {
+        setXcodeBuildMCPAppDirOverrideForTests(null);
+        rmSync(appDir, { recursive: true, force: true });
+      }
     });
   });
 

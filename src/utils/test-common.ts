@@ -22,9 +22,12 @@ import {
   markResultBundlePathCompleted,
 } from './result-bundle-path.ts';
 import {
-  createDefaultTestProductsPath,
-  markTestProductsPathCompleted,
-} from './test-products-path.ts';
+  prepareManagedTestProductsPath,
+  scheduleWorkspaceTestProductsPrune,
+  withManagedTestProductsFinalization,
+} from './managed-test-products.ts';
+import { withPreparedTestProductsReaderLease } from './test-products-reader-lease.ts';
+import { PreparedTestSourceUnavailableError } from './test-products-path.ts';
 import { resolvePathFromCwd } from './path.ts';
 import { displayPath } from './build-preflight.ts';
 import {
@@ -173,13 +176,16 @@ async function executePreparedTestCommand(
   pipeline: ReturnType<typeof createDomainStreamingPipeline>['pipeline'],
   destinationArgs?: string[],
 ): Promise<{ content: Array<{ type: 'text'; text: string }>; isError?: boolean }> {
-  const sourceArgs = params.testProductsPath
-    ? ['-testProductsPath', resolvePathFromCwd(params.testProductsPath)]
-    : params.xctestrunPath
-      ? ['-xctestrun', resolvePathFromCwd(params.xctestrunPath)]
-      : [];
+  const resolvedTestProductsPath = params.testProductsPath
+    ? resolvePathFromCwd(params.testProductsPath)
+    : undefined;
+  const resolvedXctestrunPath = params.xctestrunPath
+    ? resolvePathFromCwd(params.xctestrunPath)
+    : undefined;
+  const preparedTestSourcePath =
+    resolvedTestProductsPath ?? resolvedXctestrunPath;
   const destination = createPreparedTestDestination(params);
-  if (sourceArgs.length === 0) {
+  if (!preparedTestSourcePath) {
     return {
       content: [{ type: 'text', text: 'A prepared test artifact is required.' }],
       isError: true,
@@ -192,33 +198,57 @@ async function executePreparedTestCommand(
     };
   }
 
-  const command = [
-    'xcodebuild',
-    ...sourceArgs,
-    ...(destinationArgs && destinationArgs.length > 0
-      ? destinationArgs
-      : ['-destination', destination]),
-    '-collect-test-diagnostics',
-    'never',
-    ...extraArgs,
-    '-resultBundlePath',
-    resultBundlePath,
-    'test-without-building',
-  ];
   const sourceWorkingDirectory = resolveSourceWorkingDirectory(params);
-  const response = await executor(command, 'Test Run', false, {
-    ...execOpts,
-    ...(sourceWorkingDirectory ? { cwd: sourceWorkingDirectory } : {}),
-    onStdout: (chunk) => pipeline.onStdout(chunk),
-    onStderr: (chunk) => pipeline.onStderr(chunk),
-  });
+  try {
+    const response = await withPreparedTestProductsReaderLease(
+      preparedTestSourcePath,
+      (canonicalSourcePath) => {
+        const sourceArgs = [
+          resolvedTestProductsPath ? '-testProductsPath' : '-xctestrun',
+          canonicalSourcePath,
+        ];
+        const command = [
+          'xcodebuild',
+          ...sourceArgs,
+          ...(destinationArgs && destinationArgs.length > 0
+            ? destinationArgs
+            : ['-destination', destination]),
+          '-collect-test-diagnostics',
+          'never',
+          ...extraArgs,
+          '-resultBundlePath',
+          resultBundlePath,
+          'test-without-building',
+        ];
+        return executor(command, 'Test Run', false, {
+          ...execOpts,
+          ...(sourceWorkingDirectory ? { cwd: sourceWorkingDirectory } : {}),
+          onStdout: (chunk) => pipeline.onStdout(chunk),
+          onStderr: (chunk) => pipeline.onStderr(chunk),
+        });
+      },
+      {
+        onReleased: (workspaceKey) => {
+          scheduleWorkspaceTestProductsPrune(workspaceKey, Date.now());
+        },
+      },
+    );
 
-  return response.success
-    ? { content: [{ type: 'text', text: 'Test Run test-without-building succeeded.' }] }
-    : {
-        content: [{ type: 'text', text: 'Test Run test-without-building failed.' }],
+    return response.success
+      ? { content: [{ type: 'text', text: 'Test Run test-without-building succeeded.' }] }
+      : {
+          content: [{ type: 'text', text: 'Test Run test-without-building failed.' }],
+          isError: true,
+        };
+  } catch (error) {
+    if (error instanceof PreparedTestSourceUnavailableError) {
+      return {
+        content: [{ type: 'text', text: error.message }],
         isError: true,
       };
+    }
+    throw error;
+  }
 }
 
 type PreparedTestCommandResult = Awaited<ReturnType<typeof executePreparedTestCommand>>;
@@ -261,15 +291,14 @@ export function createTestExecutor(
       parsedResultBundleArgs.resultBundlePath ?? createDefaultResultBundlePath(toolName);
 
     if (!hasPreparedTestSource) {
-      const testProductsPath = createDefaultTestProductsPath(toolName);
-      const executionPlan = createSimulatorTwoPhaseExecutionPlan({
-        extraArgs: parsedResultBundleArgs.remainingArgs,
-        preflight: options.preflight,
-      });
+      const testProductsPath = await prepareManagedTestProductsPath(toolName);
 
-      let buildForTestingResult: Awaited<ReturnType<typeof executeXcodeBuildCommand>>;
-      try {
-        buildForTestingResult = await executeXcodeBuildCommand(
+      return withManagedTestProductsFinalization(testProductsPath, async () => {
+        const executionPlan = createSimulatorTwoPhaseExecutionPlan({
+          extraArgs: parsedResultBundleArgs.remainingArgs,
+          preflight: options.preflight,
+        });
+        const buildForTestingResult = await executeXcodeBuildCommand(
           {
             ...params,
             scheme: params.scheme!,
@@ -287,68 +316,63 @@ export function createTestExecutor(
           started.pipeline,
           { propagateInfrastructureErrors: true },
         );
-      } catch (error) {
-        markTestProductsPathCompleted(testProductsPath);
-        throw error;
-      }
 
-      if (buildForTestingResult.isError) {
-        markTestProductsPathCompleted(testProductsPath);
+        if (buildForTestingResult.isError) {
+          return createDisplayedTestDomainResult({
+            started,
+            succeeded: false,
+            target,
+            artifacts: createXcodebuildTestArtifacts(params, started),
+            fallbackErrorMessages: getFallbackErrorMessages(
+              started.stderrLines,
+              buildForTestingResult.content,
+            ),
+            includeDetectedXcresult: false,
+            preflight: options.preflight,
+            request: options.request,
+          });
+        }
+
+        started.pipeline.emitFragment({
+          kind: 'test-result',
+          fragment: 'build-stage',
+          operation: 'TEST',
+          stage: 'RUN_TESTS',
+          message: 'Running tests',
+        });
+
+        let testWithoutBuildingResult: PreparedTestCommandResult;
+        try {
+          testWithoutBuildingResult = await executePreparedTestCommand(
+            { ...params, testProductsPath },
+            filterPreparedTestExtraArgs(executionPlan.testArgs),
+            resultBundlePath,
+            executor,
+            execOpts,
+            started.pipeline,
+            getPreparedTestDestinationArgs(executionPlan.testArgs),
+          );
+        } finally {
+          if (shouldUseDefaultResultBundlePath) {
+            markResultBundlePathCompleted(resultBundlePath);
+          }
+        }
+        emitXcresultFailures(started.pipeline, resultBundlePath);
+
         return createDisplayedTestDomainResult({
           started,
-          succeeded: false,
+          succeeded: !testWithoutBuildingResult.isError,
           target,
-          artifacts: createXcodebuildTestArtifacts(params, started),
+          artifacts: createXcodebuildTestArtifacts(params, started, resultBundlePath, {
+            testProductsPath,
+          }),
           fallbackErrorMessages: getFallbackErrorMessages(
             started.stderrLines,
-            buildForTestingResult.content,
+            testWithoutBuildingResult.content,
           ),
-          includeDetectedXcresult: false,
           preflight: options.preflight,
           request: options.request,
         });
-      }
-
-      started.pipeline.emitFragment({
-        kind: 'test-result',
-        fragment: 'build-stage',
-        operation: 'TEST',
-        stage: 'RUN_TESTS',
-        message: 'Running tests',
-      });
-
-      let testWithoutBuildingResult: PreparedTestCommandResult;
-      try {
-        testWithoutBuildingResult = await executePreparedTestCommand(
-          { ...params, testProductsPath },
-          filterPreparedTestExtraArgs(executionPlan.testArgs),
-          resultBundlePath,
-          executor,
-          execOpts,
-          started.pipeline,
-          getPreparedTestDestinationArgs(executionPlan.testArgs),
-        );
-      } finally {
-        markTestProductsPathCompleted(testProductsPath);
-        if (shouldUseDefaultResultBundlePath) {
-          markResultBundlePathCompleted(resultBundlePath);
-        }
-      }
-      emitXcresultFailures(started.pipeline, resultBundlePath);
-
-      return createDisplayedTestDomainResult({
-        started,
-        succeeded: !testWithoutBuildingResult.isError,
-        target,
-        artifacts: createXcodebuildTestArtifacts(params, started, resultBundlePath, {
-          testProductsPath,
-        }),
-        fallbackErrorMessages: getFallbackErrorMessages(
-          started.stderrLines,
-          testWithoutBuildingResult.content,
-        ),
-        preflight: options.preflight,
-        request: options.request,
       });
     }
 

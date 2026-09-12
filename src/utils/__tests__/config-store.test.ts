@@ -4,6 +4,7 @@ import { createMockFileSystemExecutor } from '../../test-utils/mock-executors.ts
 import {
   __resetConfigStoreForTests,
   getConfig,
+  getTestProductsRetentionConfig,
   initConfigStore,
   persistActiveSessionDefaultsProfile,
   persistSessionDefaultsPatch,
@@ -44,6 +45,7 @@ describe('config-store', () => {
     expect(config.dapLogEvents).toBe(false);
     expect(config.launchJsonWaitMs).toBe(8000);
     expect(config.filePathRenderStyle).toBeUndefined();
+    expect(getTestProductsRetentionConfig().status).toBe('missing');
   });
 
   it('parses env values when provided', async () => {
@@ -122,6 +124,54 @@ describe('config-store', () => {
     expect(config.dapRequestTimeoutMs).toBe(12345);
     expect(config.filePathRenderStyle).toBe('list');
     expect(config.axeSourcePath).toBe('/override/AXe');
+  });
+
+  it('rejects fractional counts and non-positive ages from the environment', async () => {
+    await initConfigStore({
+      cwd,
+      fs: createFs(),
+      env: {
+        XCODEBUILDMCP_TEST_PRODUCTS_MAX_COUNT: '0.5',
+        XCODEBUILDMCP_TEST_PRODUCTS_MAX_AGE_DAYS: '0',
+      },
+    });
+
+    expect(getTestProductsRetentionConfig()).toEqual({
+      status: 'missing',
+      maxCount: 3,
+      maxAgeDays: 1,
+    });
+  });
+
+  it('marks an invalid project config so automatic retention can fail closed', async () => {
+    await initConfigStore({
+      cwd,
+      fs: createFs(
+        ['schemaVersion: 1', 'testProductsMaxCount: 0', 'testProductsMaxAgeDays: -1', ''].join(
+          '\n',
+        ),
+      ),
+    });
+
+    expect(getTestProductsRetentionConfig()).toEqual({
+      status: 'invalid',
+      maxCount: 3,
+      maxAgeDays: 1,
+    });
+  });
+
+  it('marks project configuration valid after repairing it through session persistence', async () => {
+    const fs = createFs(
+      ['schemaVersion: 1', 'testProductsMaxCount: 0', ''].join('\n'),
+    );
+    await initConfigStore({ cwd, fs });
+    expect(getTestProductsRetentionConfig().status).toBe('invalid');
+
+    await persistSessionDefaultsPatch({
+      patch: { scheme: 'App' },
+    });
+
+    expect(getTestProductsRetentionConfig().status).toBe('valid');
   });
 
   it('uses file config before env when no override is provided', async () => {

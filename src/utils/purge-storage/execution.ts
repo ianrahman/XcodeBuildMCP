@@ -1,7 +1,7 @@
 import type { Stats } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { tryAcquireFsLock, type AcquiredFsLock } from '../fs-lock.ts';
+import { withAcquiredFsLock, type AcquiredFsLock } from '../fs-lock.ts';
 import { getWorkspaceFilesystemLayout, getWorkspacesDir } from '../log-paths.ts';
 import { isPidAlive } from '../process-liveness.ts';
 import {
@@ -14,8 +14,12 @@ import {
   isXcodeBuildMCPManagedTestProductsName,
 } from '../test-products-path.ts';
 import { isProtectedManagedTestProducts } from '../test-products-lifecycle.ts';
+import { removeTestProductsReaderLeaseDirectory } from '../test-products-reader-lease.ts';
 import {
-  WORKSPACE_FILESYSTEM_LIFECYCLE_LOCK_LEASE_MS,
+  getActiveTestProductsProducerReservationNames,
+  removeTestProductsProducerReservation,
+} from '../test-products-producer-reservation.ts';
+import {
   WORKSPACE_FILESYSTEM_LIFECYCLE_MIN_VISIBLE_MS,
   collectWorkspaceLifecycleProtectedLogPaths,
   getWorkspaceLifecycleProtectedLogReason,
@@ -26,6 +30,7 @@ import {
   xcodeIdeCallToolTransientRoot,
   type WorkspaceLifecycleLogProtectionReason,
 } from '../workspace-filesystem-lifecycle.ts';
+import { tryAcquireWorkspaceFilesystemLifecycleLock } from '../workspace-filesystem-lock.ts';
 import { readRegistryRecord } from './registry-record.ts';
 import { describeFsError, errorMessage, isEnoent } from './scan.ts';
 import type {
@@ -131,6 +136,7 @@ async function validateStateTransientCandidate(
 async function validateClassSpecificDeletionCandidate(
   candidate: PurgeStorageCandidate,
   now: number,
+  activeProducerReservationNames: ReadonlySet<string>,
 ): Promise<string | null> {
   const name = path.basename(candidate.path);
   switch (candidate.storageClass) {
@@ -185,7 +191,12 @@ async function validateClassSpecificDeletionCandidate(
       if (
         await isProtectedManagedTestProducts(
           { name, path: candidate.path, mtimeMs: candidate.mtimeMs },
-          { now, minVisibleMs: 0 },
+          {
+            now,
+            minVisibleMs: 0,
+            activeProducerReservationNames,
+            cleanupStaleReaderLeases: true,
+          },
         )
       ) {
         return 'test products candidate is protected by active lifecycle owner';
@@ -199,6 +210,7 @@ async function validateClassSpecificDeletionCandidate(
 async function validateDeletionPath(
   candidate: PurgeStorageCandidate,
   now: number,
+  activeProducerReservationNames: ReadonlySet<string>,
 ): Promise<string | null> {
   const workspaceLayout = getWorkspaceFilesystemLayout(candidate.workspaceKey);
   const root = deletionRootForClass(candidate.workspaceKey, candidate.storageClass);
@@ -215,7 +227,11 @@ async function validateDeletionPath(
   if (stableError) {
     return stableError;
   }
-  return validateClassSpecificDeletionCandidate(candidate, now);
+  return validateClassSpecificDeletionCandidate(
+    candidate,
+    now,
+    activeProducerReservationNames,
+  );
 }
 
 async function validateCandidateStillMatchesPlan(
@@ -282,6 +298,16 @@ async function deleteCandidate(candidate: PurgeStorageCandidate): Promise<string
   } else {
     await fs.unlink(candidate.path);
   }
+  if (candidate.storageClass === 'testProducts') {
+    await removeTestProductsReaderLeaseDirectory(
+      candidate.workspaceKey,
+      path.basename(candidate.path),
+    ).catch(() => undefined);
+    await removeTestProductsProducerReservation(
+      candidate.workspaceKey,
+      path.basename(candidate.path),
+    ).catch(() => undefined);
+  }
 
   for (const sidecarPath of candidate.sidecarPaths) {
     const sidecarError = await validateSidecarPath(candidate, sidecarPath);
@@ -333,8 +359,17 @@ async function executeWorkspaceCandidates(params: {
   warnings: string[];
   now: number;
 }): Promise<void> {
+  const activeProducerReservationNames =
+    await getActiveTestProductsProducerReservationNames(params.workspaceKey, {
+      cleanupStale: true,
+      now: params.now,
+    });
   for (const candidate of params.candidates) {
-    const validationError = await validateDeletionPath(candidate, params.now);
+    const validationError = await validateDeletionPath(
+      candidate,
+      params.now,
+      activeProducerReservationNames,
+    );
     if (validationError) {
       params.skipped.push({
         workspaceKey: params.workspaceKey,
@@ -372,16 +407,14 @@ export async function executePurgeStoragePlan(
   const skipped: PurgeStorageSkippedCandidate[] = [...plan.skipped];
   const warnings: string[] = [...plan.warnings];
 
-  const now = options.now ?? Date.now();
   for (const [workspaceKey, candidates] of groupCandidatesByWorkspace(plan.candidates).entries()) {
-    const layout = getWorkspaceFilesystemLayout(workspaceKey);
+    const lockAttemptTimeMs = options.now ?? Date.now();
     let lock: AcquiredFsLock | null;
     try {
-      lock = await tryAcquireFsLock({
-        lockDir: layout.filesystemLifecycle.lockDir,
+      lock = await tryAcquireWorkspaceFilesystemLifecycleLock({
+        workspaceKey,
         purpose: PURGE_LOCK_PURPOSE,
-        leaseMs: WORKSPACE_FILESYSTEM_LIFECYCLE_LOCK_LEASE_MS,
-        now,
+        now: lockAttemptTimeMs,
       });
     } catch (error) {
       const message = `Workspace ${workspaceKey} skipped because its filesystem lock could not be acquired: ${errorMessage(error)}`;
@@ -397,18 +430,17 @@ export async function executePurgeStoragePlan(
       continue;
     }
 
-    try {
+    await withAcquiredFsLock(lock, async () => {
+      const evaluationTimeMs = options.now ?? Date.now();
       await executeWorkspaceCandidates({
         workspaceKey,
         candidates,
         deleted,
         skipped,
         warnings,
-        now,
+        now: evaluationTimeMs,
       });
-    } finally {
-      await lock.release();
-    }
+    });
   }
 
   return {

@@ -12,23 +12,32 @@ import {
 } from './log-capture/simulator-launch-oslog-sessions.ts';
 import { log } from './logging/index.ts';
 import { getRuntimeInstance, getRuntimeInstanceIfConfigured } from './runtime-instance.ts';
-import { tryAcquireFsLock, type AcquiredFsLock } from './fs-lock.ts';
+import {
+  tryAcquireFsLock,
+  withAcquiredFsLock,
+  type AcquiredFsLock,
+} from './fs-lock.ts';
 import { isPidAlive } from './process-liveness.ts';
 import { getResultBundleCompletionMarkerPath } from './result-bundle-path.ts';
-import { getConfig } from './config-store.ts';
+import { getTestProductsRetentionConfig } from './config-store.ts';
 import {
-  pruneManagedTestProductsDirectory,
+  tryAcquireWorkspaceFilesystemLifecycleLock,
+  WORKSPACE_FILESYSTEM_LIFECYCLE_LOCK_LEASE_MS,
+} from './workspace-filesystem-lock.ts';
+import { pruneManagedTestProductsDirectory } from './test-products-lifecycle.ts';
+import { getActiveTestProductsProducerReservationNames } from './test-products-producer-reservation.ts';
+import {
   TEST_PRODUCTS_DAY_MS,
-  TEST_PRODUCTS_MAX_AGE_DAYS,
-  TEST_PRODUCTS_MAX_COUNT,
-} from './test-products-lifecycle.ts';
+  TEST_PRODUCTS_INCOMPLETE_MIN_VISIBLE_MS,
+} from './test-products-retention-policy.ts';
 
 export const WORKSPACE_FILESYSTEM_LIFECYCLE_LOG_MAX_AGE_MS = 3 * 24 * 60 * 60 * 1000;
 export const WORKSPACE_FILESYSTEM_LIFECYCLE_LOG_MAX_FILES = 10_000;
 export const WORKSPACE_FILESYSTEM_LIFECYCLE_COOLDOWN_MS = 60 * 60 * 1000;
 export const WORKSPACE_FILESYSTEM_LIFECYCLE_SCHEDULE_DELAY_MS = 250;
-export const WORKSPACE_FILESYSTEM_LIFECYCLE_MIN_VISIBLE_MS = 60 * 60 * 1000;
-export const WORKSPACE_FILESYSTEM_LIFECYCLE_LOCK_LEASE_MS = 10 * 60 * 1000;
+export const WORKSPACE_FILESYSTEM_LIFECYCLE_MIN_VISIBLE_MS =
+  TEST_PRODUCTS_INCOMPLETE_MIN_VISIBLE_MS;
+export { WORKSPACE_FILESYSTEM_LIFECYCLE_LOCK_LEASE_MS } from './workspace-filesystem-lock.ts';
 
 const FALLBACK_MARKER_FILE = '.last-cleanup';
 const FALLBACK_LOCK_DIR_NAME = '.filesystem-lifecycle.lock';
@@ -116,6 +125,7 @@ interface ResolvedWorkspaceFilesystemLifecycleOptions {
   protectedLogPaths: string[];
   timeoutMs: number;
   lockPurpose: string;
+  usesManagedWorkspaceLock: boolean;
   daemonCleanup?: WorkspaceFilesystemLifecycleOptions['daemonCleanup'];
 }
 
@@ -169,10 +179,14 @@ function resolveOptions(
   const workspaceKey = resolveWorkspaceKey(options);
   const layout = options.logDir ? null : getWorkspaceFilesystemLayout(workspaceKey);
   const logDir = options.logDir ?? layout?.logs;
-  const config = getConfig();
+  const testProductsRetention = getTestProductsRetentionConfig();
   if (!logDir) {
     throw new Error('Workspace filesystem lifecycle requires a log directory');
   }
+  const lockDir =
+    options.lockDir ??
+    layout?.filesystemLifecycle.lockDir ??
+    path.join(logDir, FALLBACK_LOCK_DIR_NAME);
 
   return {
     workspaceKey,
@@ -182,10 +196,7 @@ function resolveOptions(
       options.markerPath ??
       layout?.filesystemLifecycle.markerPath ??
       path.join(logDir, FALLBACK_MARKER_FILE),
-    lockDir:
-      options.lockDir ??
-      layout?.filesystemLifecycle.lockDir ??
-      path.join(logDir, FALLBACK_LOCK_DIR_NAME),
+    lockDir,
     resultBundleDir: layout?.resultBundles ?? null,
     testProductsDir: layout?.testProducts ?? null,
     now: options.now ?? Date.now(),
@@ -193,15 +204,18 @@ function resolveOptions(
     maxFiles: options.maxFiles ?? WORKSPACE_FILESYSTEM_LIFECYCLE_LOG_MAX_FILES,
     testProductsMaxAgeMs:
       options.testProductsMaxAgeMs ??
-      (config.testProductsMaxAgeDays ?? TEST_PRODUCTS_MAX_AGE_DAYS) * TEST_PRODUCTS_DAY_MS,
+      testProductsRetention.maxAgeDays * TEST_PRODUCTS_DAY_MS,
     testProductsMaxCount:
-      options.testProductsMaxCount ?? config.testProductsMaxCount ?? TEST_PRODUCTS_MAX_COUNT,
+      options.testProductsMaxCount ?? testProductsRetention.maxCount,
     cooldownMs: options.cooldownMs ?? WORKSPACE_FILESYSTEM_LIFECYCLE_COOLDOWN_MS,
     force: options.force ?? false,
     minVisibleMs: options.minVisibleMs ?? WORKSPACE_FILESYSTEM_LIFECYCLE_MIN_VISIBLE_MS,
     protectedLogPaths: options.protectedLogPaths ?? [],
     timeoutMs: options.timeoutMs ?? 1000,
     lockPurpose: options.lockPurpose ?? 'filesystem-lifecycle',
+    usesManagedWorkspaceLock:
+      layout !== null &&
+      path.resolve(lockDir) === path.resolve(layout.filesystemLifecycle.lockDir),
     daemonCleanup: options.daemonCleanup,
   };
 }
@@ -607,10 +621,9 @@ function cleanupXcodeIdeCallToolTransientArtifactsSync(): {
   }
 }
 
-export async function runWorkspaceFilesystemLifecycleSweep(
-  options: WorkspaceFilesystemLifecycleOptions,
+async function runResolvedWorkspaceFilesystemLifecycleSweep(
+  resolved: ResolvedWorkspaceFilesystemLifecycleOptions,
 ): Promise<WorkspaceFilesystemLifecycleResult> {
-  const resolved = resolveOptions(options);
   const errors: string[] = [];
   const stopped = await runStartupReconciliation(resolved, errors);
   if (resolved.trigger === 'startup') {
@@ -628,12 +641,18 @@ export async function runWorkspaceFilesystemLifecycleSweep(
 
   let lock: AcquiredFsLock | null;
   try {
-    lock = await tryAcquireFsLock({
-      lockDir: resolved.lockDir,
-      purpose: resolved.lockPurpose,
-      leaseMs: WORKSPACE_FILESYSTEM_LIFECYCLE_LOCK_LEASE_MS,
-      now: resolved.now,
-    });
+    lock = resolved.usesManagedWorkspaceLock
+      ? await tryAcquireWorkspaceFilesystemLifecycleLock({
+          workspaceKey: resolved.workspaceKey,
+          purpose: resolved.lockPurpose,
+          now: resolved.now,
+        })
+      : await tryAcquireFsLock({
+          lockDir: resolved.lockDir,
+          purpose: resolved.lockPurpose,
+          leaseMs: WORKSPACE_FILESYSTEM_LIFECYCLE_LOCK_LEASE_MS,
+          now: resolved.now,
+        });
   } catch (error) {
     errors.push(error instanceof Error ? error.message : String(error));
     return zeroResult(resolved, false, true, stopped, errors);
@@ -642,7 +661,8 @@ export async function runWorkspaceFilesystemLifecycleSweep(
     return zeroResult(resolved, false, true, stopped, errors);
   }
 
-  try {
+  return withAcquiredFsLock(lock, async () => {
+    const evaluationTimeMs = resolved.now;
     if (
       !resolved.force &&
       (await shouldSkipForCooldown(resolved.markerPath, resolved.now, resolved.cooldownMs))
@@ -654,15 +674,22 @@ export async function runWorkspaceFilesystemLifecycleSweep(
     const protectedPaths = await collectProtectedLogPaths(resolved);
     const logPrune = await pruneKnownLogDirectory(resolved, protectedPaths);
     const resultBundlePrune = await pruneKnownResultBundleDirectory(resolved);
-    const testProductsPrune = resolved.testProductsDir
-      ? await pruneManagedTestProductsDirectory({
-          testProductsDir: resolved.testProductsDir,
-          now: resolved.now,
-          minVisibleMs: resolved.minVisibleMs,
-          maxAgeMs: resolved.testProductsMaxAgeMs,
-          maxCount: resolved.testProductsMaxCount,
-        })
-      : { scanned: 0, deleted: 0 };
+    const testProductsPrune =
+      resolved.testProductsDir
+        ? await pruneManagedTestProductsDirectory({
+            testProductsDir: resolved.testProductsDir,
+            now: evaluationTimeMs,
+            minVisibleMs: resolved.minVisibleMs,
+            maxAgeMs: resolved.testProductsMaxAgeMs,
+            maxCount: resolved.testProductsMaxCount,
+            activeProducerReservationNames:
+              await getActiveTestProductsProducerReservationNames(resolved.workspaceKey, {
+                cleanupStale: true,
+                now: evaluationTimeMs,
+              }),
+            cleanupStaleReaderLeases: true,
+          })
+        : { scanned: 0, deleted: 0 };
     await touchCleanupMarker(resolved.markerPath, resolved.now);
 
     return {
@@ -676,9 +703,13 @@ export async function runWorkspaceFilesystemLifecycleSweep(
       skippedByLock: false,
       errors,
     };
-  } finally {
-    await lock.release();
-  }
+  });
+}
+
+export async function runWorkspaceFilesystemLifecycleSweep(
+  options: WorkspaceFilesystemLifecycleOptions,
+): Promise<WorkspaceFilesystemLifecycleResult> {
+  return runResolvedWorkspaceFilesystemLifecycleSweep(resolveOptions(options));
 }
 
 function buildSchedulePreKey(options: WorkspaceFilesystemLifecycleOptions): string | null {
@@ -723,7 +754,7 @@ export function scheduleWorkspaceFilesystemLifecycleSweep(
   runningScheduledSweeps.add(scheduleKey);
 
   const timer = setTimeout(() => {
-    void runWorkspaceFilesystemLifecycleSweep(resolved)
+    void runResolvedWorkspaceFilesystemLifecycleSweep(resolved)
       .then((result) => {
         if (!result.skippedByCooldown && !result.skippedByLock) {
           const completedAt = Date.now();

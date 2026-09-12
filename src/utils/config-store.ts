@@ -14,7 +14,7 @@ import { normalizeSessionDefaultsProfileName } from './session-defaults-profile.
 import {
   TEST_PRODUCTS_MAX_AGE_DAYS,
   TEST_PRODUCTS_MAX_COUNT,
-} from './test-products-lifecycle.ts';
+} from './test-products-retention-policy.ts';
 
 export type RuntimeConfigOverrides = Partial<{
   enabledWorkflows: string[];
@@ -74,6 +74,8 @@ export type ResolvedRuntimeConfig = {
   activeSessionDefaultsProfile?: string;
 };
 
+export type TestProductsRetentionConfigStatus = 'missing' | 'valid' | 'invalid';
+
 type ConfigStoreState = {
   initialized: boolean;
   cwd?: string;
@@ -81,6 +83,7 @@ type ConfigStoreState = {
   env?: NodeJS.ProcessEnv;
   overrides?: RuntimeConfigOverrides;
   fileConfig?: ProjectConfig;
+  projectConfigStatus: TestProductsRetentionConfigStatus;
   resolved: ResolvedRuntimeConfig;
 };
 
@@ -105,6 +108,7 @@ const DEFAULT_CONFIG: ResolvedRuntimeConfig = {
 
 const storeState: ConfigStoreState = {
   initialized: false,
+  projectConfigStatus: 'missing',
   resolved: { ...DEFAULT_CONFIG },
 };
 
@@ -138,10 +142,33 @@ function parseNonNegativeInt(value: string | undefined): number | undefined {
   return Math.floor(parsed);
 }
 
-function parseNonNegativeNumber(value: string | undefined): number | undefined {
-  if (!value) return undefined;
+function parseTestProductsMaxCount(value: string | undefined): number | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
   const parsed = Number(value);
-  if (!Number.isFinite(parsed) || parsed < 0) return undefined;
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    log(
+      'warn',
+      `Invalid XCODEBUILDMCP_TEST_PRODUCTS_MAX_COUNT '${value}'; using the next configured fallback.`,
+    );
+    return undefined;
+  }
+  return parsed;
+}
+
+function parseTestProductsMaxAgeDays(value: string | undefined): number | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    log(
+      'warn',
+      `Invalid XCODEBUILDMCP_TEST_PRODUCTS_MAX_AGE_DAYS '${value}'; using the next configured fallback.`,
+    );
+    return undefined;
+  }
   return parsed;
 }
 
@@ -246,13 +273,13 @@ function readEnvConfig(env: NodeJS.ProcessEnv): RuntimeConfigOverrides {
   setIfDefined(
     config,
     'testProductsMaxCount',
-    parseNonNegativeInt(env.XCODEBUILDMCP_TEST_PRODUCTS_MAX_COUNT),
+    parseTestProductsMaxCount(env.XCODEBUILDMCP_TEST_PRODUCTS_MAX_COUNT),
   );
 
   setIfDefined(
     config,
     'testProductsMaxAgeDays',
-    parseNonNegativeNumber(env.XCODEBUILDMCP_TEST_PRODUCTS_MAX_AGE_DAYS),
+    parseTestProductsMaxAgeDays(env.XCODEBUILDMCP_TEST_PRODUCTS_MAX_AGE_DAYS),
   );
 
   const axePath = env.XCODEBUILDMCP_AXE_PATH ?? env.AXE_PATH;
@@ -673,6 +700,7 @@ export async function initConfigStore(opts: {
   let found = false;
   let path: string | undefined;
   let notices: string[] = [];
+  let projectConfigStatus: TestProductsRetentionConfigStatus = 'missing';
 
   try {
     const result = await loadProjectConfig({ fs: opts.fs, cwd: opts.cwd });
@@ -681,13 +709,16 @@ export async function initConfigStore(opts: {
       found = true;
       path = result.path;
       notices = result.notices;
+      projectConfigStatus = 'valid';
     } else if ('error' in result) {
+      projectConfigStatus = 'invalid';
       const errorMessage =
         result.error instanceof Error ? result.error.message : String(result.error);
       log('warn', `Failed to read or parse project config at ${result.path}. ${errorMessage}`);
       log('warn', '[infra/config-store] project config read/parse failed', { sentry: true });
     }
   } catch (error) {
+    projectConfigStatus = 'invalid';
     log('warn', `Failed to load project config from ${opts.cwd}. ${error}`);
     log('warn', `[infra/config-store] project config load threw (${getErrorKind(error)})`, {
       sentry: true,
@@ -695,6 +726,7 @@ export async function initConfigStore(opts: {
   }
 
   storeState.fileConfig = fileConfig;
+  storeState.projectConfigStatus = projectConfigStatus;
   storeState.resolved = resolveConfig({ fileConfig, overrides: opts.overrides, env: opts.env });
   storeState.initialized = true;
   return { found, path, notices };
@@ -706,6 +738,19 @@ export function getConfig(): ResolvedRuntimeConfig {
   }
 
   return storeState.resolved;
+}
+
+export function getTestProductsRetentionConfig(): {
+  status: TestProductsRetentionConfigStatus;
+  maxCount: number;
+  maxAgeDays: number;
+} {
+  const config = getConfig();
+  return {
+    status: storeState.initialized ? storeState.projectConfigStatus : 'missing',
+    maxCount: config.testProductsMaxCount ?? TEST_PRODUCTS_MAX_COUNT,
+    maxAgeDays: config.testProductsMaxAgeDays ?? TEST_PRODUCTS_MAX_AGE_DAYS,
+  };
 }
 
 export async function persistSessionDefaultsPatch(opts: {
@@ -733,6 +778,7 @@ export async function persistSessionDefaultsPatch(opts: {
     patch: opts.patch,
     deleteKeys: opts.deleteKeys,
   });
+  storeState.projectConfigStatus = 'valid';
   refreshResolvedSessionFields();
 
   return result;
@@ -757,6 +803,7 @@ export async function persistActiveSessionDefaultsProfile(
     fileConfig: getCurrentFileConfig(),
     profile: normalizedProfile,
   });
+  storeState.projectConfigStatus = 'valid';
   refreshResolvedSessionFields();
 
   return result;
@@ -769,5 +816,6 @@ export function __resetConfigStoreForTests(): void {
   storeState.env = undefined;
   storeState.overrides = undefined;
   storeState.fileConfig = undefined;
+  storeState.projectConfigStatus = 'missing';
   storeState.resolved = { ...DEFAULT_CONFIG };
 }

@@ -9,6 +9,17 @@ import {
 } from '../../../../test-utils/test-helpers.ts';
 import { sessionStore } from '../../../../utils/session-store.ts';
 import { schema, handler, buildMacOSLogic } from '../build_macos.ts';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import * as path from 'node:path';
+import { setXcodeBuildMCPAppDirOverrideForTests } from '../../../../utils/log-paths.ts';
+import { getTestProductsCompletionMarkerPath } from '../../../../utils/test-products-path.ts';
 
 const runBuildMacOS = (
   params: Parameters<typeof buildMacOSLogic>[0],
@@ -385,6 +396,10 @@ describe('build_macos plugin', () => {
     it('should prepare reusable macOS test products without app inspection', async () => {
       const calls: string[][] = [];
       const testProductsPath = '/tmp/MyApp Tests.xctestproducts';
+      const pinnedTestProductsPath = path.join(
+        realpathSync('/tmp'),
+        path.basename(testProductsPath),
+      );
       const executor = createMockExecutor({
         success: true,
         output: 'BUILD SUCCEEDED',
@@ -404,11 +419,42 @@ describe('build_macos plugin', () => {
       expect(calls).toHaveLength(1);
       expect(calls[0].slice(-3)).toEqual([
         '-testProductsPath',
-        testProductsPath,
+        pinnedTestProductsPath,
         'build-for-testing',
       ]);
-      expect(result.nextStepParams).toEqual({ test_macos: { testProductsPath } });
+      expect(result.nextStepParams).toEqual({
+        test_macos: { testProductsPath: pinnedTestProductsPath },
+      });
       expect(result.nextStepConditionKeys).toEqual(['prepared_tests_available']);
+    });
+
+    it('should finalize generated test products when xcodebuild infrastructure throws', async () => {
+      const appDir = mkdtempSync(path.join(tmpdir(), 'xcodebuildmcp-build-macos-products-'));
+      setXcodeBuildMCPAppDirOverrideForTests(appDir);
+      let testProductsPath: string | undefined;
+      try {
+        const executor = async (command: string[]) => {
+          const index = command.indexOf('-testProductsPath');
+          testProductsPath = command[index + 1];
+          mkdirSync(testProductsPath!);
+          throw new Error('spawn failed');
+        };
+
+        const { result } = await runBuildMacOS(
+          {
+            projectPath: '/path/to/project.xcodeproj',
+            scheme: 'MyScheme',
+            buildForTesting: true,
+          },
+          executor,
+        );
+
+        expect(result.isError()).toBe(true);
+        expect(existsSync(getTestProductsCompletionMarkerPath(testProductsPath!))).toBe(true);
+      } finally {
+        setXcodeBuildMCPAppDirOverrideForTests(null);
+        rmSync(appDir, { recursive: true, force: true });
+      }
     });
   });
 

@@ -8,7 +8,7 @@
 
 ### Fixed
 
-- Reduced managed test-product retention to three bundles for one day and added `testProductsMaxCount` and `testProductsMaxAgeDays` project configuration, with matching environment overrides, to substantially reduce disk growth from repeated test runs ([#524](https://github.com/getsentry/XcodeBuildMCP/issues/524)).
+- Reconciled idle managed test products at lifecycle boundaries while protecting active producers, readers, and recent handoffs across processes. Retention defaults to three bundles for one day and can be configured with `testProductsMaxCount` and `testProductsMaxAgeDays`, with environment fallbacks; temporary handoff overage is reclaimed by later lifecycle activity and caller-owned paths remain untouched ([#524](https://github.com/getsentry/XcodeBuildMCP/issues/524)).
 
 ## [2.7.0]
 

@@ -27,10 +27,14 @@ import { resolveEffectiveDerivedDataPath } from '../../../utils/derived-data-pat
 import { resolvePathFromCwd } from '../../../utils/path.ts';
 import { filterTestProductsPathArgs } from '../../../utils/test-source.ts';
 import {
-  createDefaultTestProductsPath,
   findXctestrunPaths,
-  markTestProductsPathCompleted,
+  resolveCallerOwnedTestProductsOutputPath,
 } from '../../../utils/test-products-path.ts';
+import {
+  finalizeManagedTestProductsPathPreservingFailure,
+  prepareManagedTestProductsPath,
+  withManagedTestProductsFinalization,
+} from '../../../utils/managed-test-products.ts';
 import { createBuildInvocationFragment } from '../../../utils/xcodebuild-pipeline.ts';
 
 interface PreparedBuildMacOSExecution {
@@ -42,11 +46,19 @@ interface PreparedBuildMacOSExecution {
   testProductsPath?: string;
 }
 
-function prepareBuildMacOSExecution(params: BuildMacOSParams): PreparedBuildMacOSExecution {
+async function prepareBuildMacOSExecution(
+  params: BuildMacOSParams,
+): Promise<PreparedBuildMacOSExecution> {
   const buildForTesting = params.buildForTesting ?? false;
-  const isManagedTestProductsPath = buildForTesting && params.testProductsPath === undefined;
+  let explicitTestProductsPath = resolvePathFromCwd(params.testProductsPath);
+  if (buildForTesting && explicitTestProductsPath) {
+    explicitTestProductsPath =
+      await resolveCallerOwnedTestProductsOutputPath(explicitTestProductsPath);
+  }
+  const isManagedTestProductsPath = buildForTesting && explicitTestProductsPath === undefined;
   const testProductsPath = buildForTesting
-    ? (resolvePathFromCwd(params.testProductsPath) ?? createDefaultTestProductsPath('build_macos'))
+    ? (explicitTestProductsPath ??
+      (await prepareManagedTestProductsPath('build_macos')))
     : undefined;
   const sharedBuildParams = testProductsPath
     ? {
@@ -135,77 +147,80 @@ export function createBuildMacOSExecutor(
   prepared?: PreparedBuildMacOSExecution,
 ): StreamingExecutor<BuildMacOSParams, BuildMacOSResult> {
   return async (params, ctx) => {
-    const resolved = prepared ?? prepareBuildMacOSExecution(params);
-    const configuration = params.configuration;
-    const started = createDomainStreamingPipeline('build_macos', 'BUILD', ctx, 'build-result');
-    const buildResult = await executeXcodeBuildCommand(
-      { ...resolved.sharedBuildParams, configuration },
-      {
-        platform: XcodePlatform.macOS,
-        arch: params.arch,
-        logPrefix: `macOS ${resolved.logLabel}`,
-      },
-      params.preferXcodebuild ?? false,
-      resolved.buildAction,
-      executor,
-      undefined,
-      started.pipeline,
-    );
+    const resolved = prepared ?? (await prepareBuildMacOSExecution(params));
+    const execute = async (): Promise<BuildMacOSResult> => {
+      const configuration = params.configuration;
+      const started = createDomainStreamingPipeline('build_macos', 'BUILD', ctx, 'build-result');
+      const buildResult = await executeXcodeBuildCommand(
+        { ...resolved.sharedBuildParams, configuration },
+        {
+          platform: XcodePlatform.macOS,
+          arch: params.arch,
+          logPrefix: `macOS ${resolved.logLabel}`,
+        },
+        params.preferXcodebuild ?? false,
+        resolved.buildAction,
+        executor,
+        undefined,
+        started.pipeline,
+      );
 
-    let bundleId: string | undefined;
-    if (!buildResult.isError && !params.buildForTesting) {
-      try {
-        const appPath = await resolveAppPathFromBuildSettings(
-          {
-            projectPath: params.projectPath,
-            workspacePath: params.workspacePath,
-            scheme: params.scheme,
-            configuration,
-            platform: XcodePlatform.macOS,
-            derivedDataPath: params.derivedDataPath,
-            extraArgs: params.extraArgs,
-          },
-          executor,
-        );
+      let bundleId: string | undefined;
+      if (!buildResult.isError && !params.buildForTesting) {
+        try {
+          const appPath = await resolveAppPathFromBuildSettings(
+            {
+              projectPath: params.projectPath,
+              workspacePath: params.workspacePath,
+              scheme: params.scheme,
+              configuration,
+              platform: XcodePlatform.macOS,
+              derivedDataPath: params.derivedDataPath,
+              extraArgs: params.extraArgs,
+            },
+            executor,
+          );
 
-        const plistResult = await executor(
-          ['defaults', 'read', `${appPath}/Contents/Info`, 'CFBundleIdentifier'],
-          'Extract Bundle ID',
-          false,
-        );
-        if (plistResult.success && plistResult.output) {
-          bundleId = plistResult.output.trim();
+          const plistResult = await executor(
+            ['defaults', 'read', `${appPath}/Contents/Info`, 'CFBundleIdentifier'],
+            'Extract Bundle ID',
+            false,
+          );
+          if (plistResult.success && plistResult.output) {
+            bundleId = plistResult.output.trim();
+          }
+        } catch {
+          // bundle ID is informational only
         }
-      } catch {
-        // bundle ID is informational only
       }
-    }
-    const succeeded = !buildResult.isError;
+      const succeeded = !buildResult.isError;
 
-    if (resolved.isManagedTestProductsPath) {
-      markTestProductsPathCompleted(resolved.testProductsPath);
-    }
+      const xctestrunPaths =
+        succeeded && resolved.testProductsPath
+          ? await findXctestrunPaths(resolved.testProductsPath)
+          : [];
 
-    const xctestrunPaths =
-      succeeded && resolved.testProductsPath
-        ? await findXctestrunPaths(resolved.testProductsPath)
-        : [];
-
-    return createBuildDomainResult({
-      started,
-      succeeded,
-      target: 'macos',
-      artifacts: {
-        ...(bundleId ? { bundleId } : {}),
-        buildLogPath: displayPath(started.pipeline.logPath),
-        ...(succeeded && resolved.testProductsPath
-          ? { testProductsPath: displayPath(resolved.testProductsPath) }
-          : {}),
-        ...(xctestrunPaths.length > 0 ? { xctestrunPaths: xctestrunPaths.map(displayPath) } : {}),
-      },
-      fallbackErrorMessages: collectFallbackErrorMessages(started, [], buildResult.content),
-      request: resolved.invocationRequest,
-    });
+      return createBuildDomainResult({
+        started,
+        succeeded,
+        target: 'macos',
+        artifacts: {
+          ...(bundleId ? { bundleId } : {}),
+          buildLogPath: displayPath(started.pipeline.logPath),
+          ...(succeeded && resolved.testProductsPath
+            ? { testProductsPath: displayPath(resolved.testProductsPath) }
+            : {}),
+          ...(xctestrunPaths.length > 0
+            ? { xctestrunPaths: xctestrunPaths.map(displayPath) }
+            : {}),
+        },
+        fallbackErrorMessages: collectFallbackErrorMessages(started, [], buildResult.content),
+        request: resolved.invocationRequest,
+      });
+    };
+    return resolved.isManagedTestProductsPath
+      ? withManagedTestProductsFinalization(resolved.testProductsPath, execute)
+      : execute();
   };
 }
 
@@ -214,32 +229,44 @@ export async function buildMacOSLogic(
   executor: CommandExecutor,
 ): Promise<void> {
   const ctx = getHandlerContext();
-  const prepared = prepareBuildMacOSExecution(params);
+  const prepared = await prepareBuildMacOSExecution(params);
+  let executionOwnsFinalization = false;
 
-  log('info', `Starting macOS build for scheme ${params.scheme}`);
+  try {
+    log('info', `Starting macOS build for scheme ${params.scheme}`);
 
-  ctx.emit(createBuildInvocationFragment('build-result', 'BUILD', prepared.invocationRequest));
-  const executionContext = createStreamingExecutionContext(ctx);
-  const executeBuildMacOS = createBuildMacOSExecutor(executor, prepared);
-  const result = await executeBuildMacOS(params, executionContext);
+    ctx.emit(createBuildInvocationFragment('build-result', 'BUILD', prepared.invocationRequest));
+    const executionContext = createStreamingExecutionContext(ctx);
+    const executeBuildMacOS = createBuildMacOSExecutor(executor, prepared);
+    executionOwnsFinalization = true;
+    const result = await executeBuildMacOS(params, executionContext);
 
-  setXcodebuildStructuredOutput(ctx, 'build-result', result, '3');
+    setXcodebuildStructuredOutput(ctx, 'build-result', result, '3');
 
-  if (!result.didError) {
-    if (prepared.testProductsPath) {
-      const nextParams = { testProductsPath: displayPath(prepared.testProductsPath) };
-      ctx.nextStepParams = { test_macos: nextParams };
-      ctx.nextStepConditionKeys = ['prepared_tests_available'];
-    } else {
-      const nextParams = {
-        scheme: params.scheme,
-        ...(params.derivedDataPath !== undefined
-          ? { derivedDataPath: params.derivedDataPath }
-          : {}),
-      };
-      ctx.nextStepParams = { get_mac_app_path: nextParams };
-      ctx.nextStepConditionKeys = ['app_build_succeeded'];
+    if (!result.didError) {
+      if (prepared.testProductsPath) {
+        const nextParams = { testProductsPath: displayPath(prepared.testProductsPath) };
+        ctx.nextStepParams = { test_macos: nextParams };
+        ctx.nextStepConditionKeys = ['prepared_tests_available'];
+      } else {
+        const nextParams = {
+          scheme: params.scheme,
+          ...(params.derivedDataPath !== undefined
+            ? { derivedDataPath: params.derivedDataPath }
+            : {}),
+        };
+        ctx.nextStepParams = { get_mac_app_path: nextParams };
+        ctx.nextStepConditionKeys = ['app_build_succeeded'];
+      }
     }
+  } catch (error) {
+    if (!executionOwnsFinalization && prepared.isManagedTestProductsPath) {
+      await finalizeManagedTestProductsPathPreservingFailure(
+        prepared.testProductsPath,
+        { error },
+      );
+    }
+    throw error;
   }
 }
 

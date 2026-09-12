@@ -489,6 +489,39 @@ describe('workspace filesystem lifecycle', () => {
     }
   });
 
+  it('scheduled workspace sweeps retain managed test-products cleanup', async () => {
+    const now = Date.now();
+    const layout = getWorkspaceFilesystemLayout('workspace-a');
+    const completedProducts = path.join(
+      layout.testProducts,
+      managedTestProductsName('scheduled'),
+    );
+    writeTestProductsWithMtime(completedProducts, now - 2 * 24 * 60 * 60 * 1000);
+    writeFileWithMtime(
+      getTestProductsCompletionMarkerPath(completedProducts),
+      'completed',
+      now - 2 * 24 * 60 * 60 * 1000,
+    );
+
+    scheduleWorkspaceFilesystemLifecycleSweep({
+      workspaceKey: 'workspace-a',
+      trigger: 'artifact-created',
+      now,
+      force: true,
+      minVisibleMs: 0,
+      testProductsMaxCount: 0,
+    });
+
+    for (
+      let attempt = 0;
+      attempt < 40 && existsSync(completedProducts);
+      attempt += 1
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(existsSync(completedProducts)).toBe(false);
+  });
+
   it('uses the lifecycle lock to skip a held same-workspace sweep', async () => {
     const now = Date.UTC(2026, 4, 2, 12);
     const layout = getWorkspaceFilesystemLayout('workspace-a');

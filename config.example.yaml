@@ -8,8 +8,8 @@ customWorkflows:
 experimentalWorkflowDiscovery: false
 disableSessionDefaults: false
 incrementalBuildsEnabled: false
-testProductsMaxCount: 3 # managed paths only; caller-provided paths are never pruned
-testProductsMaxAgeDays: 1
+testProductsMaxCount: 3 # idle budget; active producers/readers/handoffs reconcile on later lifecycle activity
+testProductsMaxAgeDays: 1 # number > 0; project config takes precedence over env fallbacks
 debug: false
 sentryDisabled: false
 filePathRenderStyle: 'list' # text output file artifacts: list or tree

@@ -9,6 +9,17 @@ import {
 } from '../../../../test-utils/test-helpers.ts';
 import { schema, handler, buildDeviceLogic } from '../build_device.ts';
 import { sessionStore } from '../../../../utils/session-store.ts';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import * as path from 'node:path';
+import { setXcodeBuildMCPAppDirOverrideForTests } from '../../../../utils/log-paths.ts';
+import { getTestProductsCompletionMarkerPath } from '../../../../utils/test-products-path.ts';
 function createSpyExecutor(): {
   commandCalls: Array<{ args: string[]; logPrefix?: string }>;
   executor: ReturnType<typeof createMockExecutor>;
@@ -393,6 +404,10 @@ describe('build_device plugin', () => {
     it('should prepare reusable test products for a selected device', async () => {
       const spy = createSpyExecutor();
       const testProductsPath = '/tmp/MyApp Tests.xctestproducts';
+      const pinnedTestProductsPath = path.join(
+        realpathSync('/tmp'),
+        path.basename(testProductsPath),
+      );
 
       const { result } = await runToolLogic(() =>
         buildDeviceLogic(
@@ -412,13 +427,13 @@ describe('build_device plugin', () => {
       expect(spy.commandCalls[0].args).toContain('platform=iOS,id=DEVICE-UDID');
       expect(spy.commandCalls[0].args.slice(-3)).toEqual([
         '-testProductsPath',
-        testProductsPath,
+        pinnedTestProductsPath,
         'build-for-testing',
       ]);
       expect(spy.commandCalls[0].logPrefix).toBe('iOS Device Build for Testing');
       expect(result.nextStepParams).toEqual({
         test_device: {
-          testProductsPath,
+          testProductsPath: pinnedTestProductsPath,
           deviceId: 'DEVICE-UDID',
           platform: 'iOS',
         },
@@ -445,6 +460,37 @@ describe('build_device plugin', () => {
       expect(spy.commandCalls[0].args).toContain('generic/platform=iOS');
       expect(result.nextStepParams).toBeUndefined();
       expect(result.nextStepConditionKeys).toBeUndefined();
+    });
+
+    it('should finalize generated test products when xcodebuild infrastructure throws', async () => {
+      const appDir = mkdtempSync(path.join(tmpdir(), 'xcodebuildmcp-build-device-products-'));
+      setXcodeBuildMCPAppDirOverrideForTests(appDir);
+      let testProductsPath: string | undefined;
+      try {
+        const executor = async (command: string[]) => {
+          const index = command.indexOf('-testProductsPath');
+          testProductsPath = command[index + 1];
+          mkdirSync(testProductsPath!);
+          throw new Error('spawn failed');
+        };
+
+        const { result } = await runToolLogic(() =>
+          buildDeviceLogic(
+            {
+              projectPath: '/path/to/MyProject.xcodeproj',
+              scheme: 'MyScheme',
+              buildForTesting: true,
+            },
+            executor,
+          ),
+        );
+
+        expect(result.isError()).toBe(true);
+        expect(existsSync(getTestProductsCompletionMarkerPath(testProductsPath!))).toBe(true);
+      } finally {
+        setXcodeBuildMCPAppDirOverrideForTests(null);
+        rmSync(appDir, { recursive: true, force: true });
+      }
     });
   });
 });

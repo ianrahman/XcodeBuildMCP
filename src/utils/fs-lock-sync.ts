@@ -53,6 +53,9 @@ function shouldRecoverLockDir(
       ? { recover: true, owner: null }
       : { recover: false };
   }
+  if (staleOwner.releasedAtMs !== undefined) {
+    return { recover: true, owner: staleOwner };
+  }
   if (
     staleOwner.purpose !== purpose ||
     staleOwner.expiresAtMs > now ||

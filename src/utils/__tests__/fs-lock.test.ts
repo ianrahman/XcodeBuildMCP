@@ -1,11 +1,35 @@
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import * as fsPromises from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
-import { FS_LOCK_OWNER_FILE, tryAcquireFsLock, type FsLockOwner } from '../fs-lock.ts';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import {
+  FS_LOCK_OWNER_FILE,
+  resetFsLockReleaseRetriesForTests,
+  tryAcquireFsLock,
+  withAcquiredFsLock,
+  type FsLockOwner,
+} from '../fs-lock.ts';
 import { guardDirForLockDir } from '../fs-lock-shared.ts';
 import { tryAcquireFsLockSync } from '../fs-lock-sync.ts';
+
+const renameFailure = vi.hoisted(() => ({
+  error: undefined as NodeJS.ErrnoException | undefined,
+  sourcePath: undefined as string | undefined,
+}));
+
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof fsPromises>();
+  return {
+    ...actual,
+    async rename(sourcePath: string, destinationPath: string): Promise<void> {
+      if (sourcePath === renameFailure.sourcePath && renameFailure.error) {
+        throw renameFailure.error;
+      }
+      await actual.rename(sourcePath, destinationPath);
+    },
+  };
+});
 
 const PURPOSE = 'filesystem-lifecycle';
 const LEASE_MS = 10_000;
@@ -34,7 +58,9 @@ function lockDirFor(appDir: string): string {
 }
 
 async function makeTempDir(): Promise<string> {
-  const tempDir = await mkdtemp(path.join(tmpdir(), 'xcodebuildmcp-fs-lock-'));
+  const tempDir = await fsPromises.mkdtemp(
+    path.join(tmpdir(), 'xcodebuildmcp-fs-lock-'),
+  );
   tempDirs.push(tempDir);
   return tempDir;
 }
@@ -46,8 +72,12 @@ function makeTempDirSync(): string {
 }
 
 async function writeOwner(lockDir: string, owner: FsLockOwner): Promise<void> {
-  await mkdir(lockDir, { recursive: true });
-  await writeFile(ownerPath(lockDir), `${JSON.stringify(owner)}\n`, 'utf8');
+  await fsPromises.mkdir(lockDir, { recursive: true });
+  await fsPromises.writeFile(
+    ownerPath(lockDir),
+    `${JSON.stringify(owner)}\n`,
+    'utf8',
+  );
 }
 
 function writeOwnerSync(lockDir: string, owner: FsLockOwner): void {
@@ -56,7 +86,9 @@ function writeOwnerSync(lockDir: string, owner: FsLockOwner): void {
 }
 
 async function readOwner(lockDir: string): Promise<FsLockOwner> {
-  return JSON.parse(await readFile(ownerPath(lockDir), 'utf8')) as FsLockOwner;
+  return JSON.parse(
+    await fsPromises.readFile(ownerPath(lockDir), 'utf8'),
+  ) as FsLockOwner;
 }
 
 function readOwnerSync(lockDir: string): FsLockOwner {
@@ -64,9 +96,16 @@ function readOwnerSync(lockDir: string): FsLockOwner {
 }
 
 afterEach(async () => {
+  renameFailure.error = undefined;
+  renameFailure.sourcePath = undefined;
+  resetFsLockReleaseRetriesForTests();
   const dirs = tempDirs;
   tempDirs = [];
-  await Promise.all(dirs.map((tempDir) => rm(tempDir, { recursive: true, force: true })));
+  await Promise.all(
+    dirs.map((tempDir) =>
+      fsPromises.rm(tempDir, { recursive: true, force: true }),
+    ),
+  );
 });
 
 describe('tryAcquireFsLock', () => {
@@ -85,18 +124,22 @@ describe('tryAcquireFsLock', () => {
 
     await lock?.release();
 
-    await expect(readFile(ownerPath(lockDir), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(
+      fsPromises.readFile(ownerPath(lockDir), 'utf8'),
+    ).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('does not create the main lock while a guard is held', async () => {
     const tempDir = await makeTempDir();
     const lockDir = lockDirFor(tempDir);
-    await mkdir(guardDirForLockDir(lockDir), { recursive: true });
+    await fsPromises.mkdir(guardDirForLockDir(lockDir), { recursive: true });
 
     const lock = await tryAcquireFsLock({ lockDir, purpose: PURPOSE, leaseMs: LEASE_MS });
 
     expect(lock).toBeNull();
-    await expect(readFile(ownerPath(lockDir), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(
+      fsPromises.readFile(ownerPath(lockDir), 'utf8'),
+    ).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('recovers an expired stale guard before acquiring the main lock', async () => {
@@ -131,6 +174,22 @@ describe('tryAcquireFsLock', () => {
     await lock?.release();
   });
 
+  it('propagates operational stale-lock quarantine failures', async () => {
+    const tempDir = await makeTempDir();
+    const lockDir = lockDirFor(tempDir);
+    const now = Date.UTC(2026, 4, 2, 12);
+    await writeOwner(lockDir, makeOwner({ expiresAtMs: now - 1 }));
+    const quarantineError = Object.assign(new Error('quarantine failed'), {
+      code: 'EIO',
+    });
+    renameFailure.sourcePath = lockDir;
+    renameFailure.error = quarantineError;
+
+    await expect(
+      tryAcquireFsLock({ lockDir, purpose: PURPOSE, leaseMs: LEASE_MS, now }),
+    ).rejects.toBe(quarantineError);
+  });
+
   it('does not recover an expired lock owned by a live process', async () => {
     const tempDir = await makeTempDir();
     const lockDir = lockDirFor(tempDir);
@@ -146,6 +205,116 @@ describe('tryAcquireFsLock', () => {
 
     expect(lock).toBeNull();
     expect(await readOwner(lockDir)).toMatchObject(liveOwner);
+  });
+
+  it('releases its lock even if the owner file becomes unreadable', async () => {
+    const tempDir = await makeTempDir();
+    const lockDir = lockDirFor(tempDir);
+    const lock = await tryAcquireFsLock({ lockDir, purpose: PURPOSE, leaseMs: LEASE_MS });
+
+    await fsPromises.rm(ownerPath(lockDir));
+    await fsPromises.symlink(ownerPath(lockDir), ownerPath(lockDir));
+    await lock?.release();
+
+    await expect(fsPromises.lstat(lockDir)).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+  });
+
+  it('does not recover an old lock whose owner file cannot be read', async () => {
+    const tempDir = await makeTempDir();
+    const lockDir = lockDirFor(tempDir);
+    const now = Date.UTC(2026, 4, 2, 12);
+    await fsPromises.mkdir(lockDir, { recursive: true });
+    await fsPromises.symlink(ownerPath(lockDir), ownerPath(lockDir));
+    const old = new Date(now - 2 * LEASE_MS);
+    await fsPromises.utimes(lockDir, old, old);
+
+    const lock = await tryAcquireFsLock({ lockDir, purpose: PURPOSE, leaseMs: LEASE_MS, now });
+
+    expect(lock).toBeNull();
+    expect((await fsPromises.lstat(ownerPath(lockDir))).isSymbolicLink()).toBe(
+      true,
+    );
+  });
+
+  it('preserves both an operation failure and a lock-release failure', async () => {
+    const operationError = new Error('operation failed');
+    const releaseError = new Error('release failed');
+    let caughtError: unknown;
+
+    try {
+      await withAcquiredFsLock(
+        {
+          owner: makeOwner(),
+          release: async () => {
+            throw releaseError;
+          },
+        },
+        async () => {
+          throw operationError;
+        },
+      );
+    } catch (error) {
+      caughtError = error;
+    }
+
+    expect(caughtError).toBeInstanceOf(AggregateError);
+    const aggregateError = caughtError as AggregateError;
+    expect(aggregateError.errors).toEqual([operationError, releaseError]);
+  });
+
+  it('marks a physically unreleased lock as recoverable despite its live owner', async () => {
+    const tempDir = await makeTempDir();
+    const lockDir = lockDirFor(tempDir);
+    const locksDir = path.dirname(lockDir);
+    const lock = await tryAcquireFsLock({ lockDir, purpose: PURPOSE, leaseMs: LEASE_MS });
+
+    await fsPromises.chmod(locksDir, 0o500);
+    try {
+      await expect(lock?.release()).rejects.toBeDefined();
+    } finally {
+      await fsPromises.chmod(locksDir, 0o700);
+    }
+    expect(await readOwner(lockDir)).toMatchObject({
+      pid: process.pid,
+      releasedAtMs: expect.any(Number),
+    });
+
+    const recovered = await tryAcquireFsLock({
+      lockDir,
+      purpose: PURPOSE,
+      leaseMs: LEASE_MS,
+    });
+
+    expect(recovered).not.toBeNull();
+    await recovered?.release();
+  });
+
+  it('does not publish a release marker over changed owner state', async () => {
+    const tempDir = await makeTempDir();
+    const lockDir = lockDirFor(tempDir);
+    const locksDir = path.dirname(lockDir);
+    const lock = await tryAcquireFsLock({ lockDir, purpose: PURPOSE, leaseMs: LEASE_MS });
+    const changedOwner = { changed: true };
+    await fsPromises.writeFile(
+      ownerPath(lockDir),
+      `${JSON.stringify(changedOwner)}\n`,
+      'utf8',
+    );
+
+    await fsPromises.chmod(locksDir, 0o500);
+    try {
+      await expect(lock?.release()).rejects.toThrow(
+        'Filesystem lock release and recoverable-owner update both failed',
+      );
+    } finally {
+      await fsPromises.chmod(locksDir, 0o700);
+    }
+
+    expect(
+      JSON.parse(await fsPromises.readFile(ownerPath(lockDir), 'utf8')),
+    ).toEqual(changedOwner);
   });
 });
 

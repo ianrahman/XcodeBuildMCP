@@ -8,6 +8,7 @@ import {
   isXcodeBuildMCPManagedTestProductsName,
 } from '../test-products-path.ts';
 import { isProtectedManagedTestProducts } from '../test-products-lifecycle.ts';
+import { getActiveTestProductsProducerReservationNames } from '../test-products-producer-reservation.ts';
 import { describeFsError, errorMessage, isEnoent, scanPath } from './scan.ts';
 import type {
   PurgeStorageCandidate,
@@ -97,6 +98,11 @@ export async function collectTestProductsCandidates(
 ): Promise<PlannedTestProductsCandidate[]> {
   const testProductsDir = getWorkspaceFilesystemLayout(workspaceKey).testProducts;
   const { entries, error } = await readManagedDir(testProductsDir);
+  const activeProducerReservationNames =
+    await getActiveTestProductsProducerReservationNames(workspaceKey, {
+      cleanupStale: false,
+      now: options.now,
+    });
   const planned: PlannedTestProductsCandidate[] = error
     ? [skipped(workspaceKey, testProductsDir, `directory unreadable; skipped (${error})`)]
     : [];
@@ -134,7 +140,7 @@ export async function collectTestProductsCandidates(
     if (
       await isProtectedManagedTestProducts(
         { name: entry.name, path: candidatePath, mtimeMs: stat.mtimeMs },
-        { now: options.now, minVisibleMs: 0 },
+        { now: options.now, minVisibleMs: 0, activeProducerReservationNames },
       )
     ) {
       planned.push(skipped(workspaceKey, candidatePath, 'protected by active lifecycle owner'));

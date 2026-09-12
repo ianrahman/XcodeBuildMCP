@@ -38,10 +38,14 @@ import { resolveEffectiveDerivedDataPath } from '../../../utils/derived-data-pat
 import { resolvePathFromCwd } from '../../../utils/path.ts';
 import { filterTestProductsPathArgs } from '../../../utils/test-source.ts';
 import {
-  createDefaultTestProductsPath,
   findXctestrunPaths,
-  markTestProductsPathCompleted,
+  resolveCallerOwnedTestProductsOutputPath,
 } from '../../../utils/test-products-path.ts';
+import {
+  finalizeManagedTestProductsPathPreservingFailure,
+  prepareManagedTestProductsPath,
+  withManagedTestProductsFinalization,
+} from '../../../utils/managed-test-products.ts';
 import { createBuildInvocationFragment } from '../../../utils/xcodebuild-pipeline.ts';
 
 const baseOptions = {
@@ -137,9 +141,15 @@ export async function prepareBuildSimExecution(
   const detectedPlatform = inferred.platform;
   const platformName = detectedPlatform.replace(' Simulator', '');
   const buildForTesting = params.buildForTesting ?? false;
-  const isManagedTestProductsPath = buildForTesting && params.testProductsPath === undefined;
+  let explicitTestProductsPath = resolvePathFromCwd(params.testProductsPath);
+  if (buildForTesting && explicitTestProductsPath) {
+    explicitTestProductsPath =
+      await resolveCallerOwnedTestProductsOutputPath(explicitTestProductsPath);
+  }
+  const isManagedTestProductsPath = buildForTesting && explicitTestProductsPath === undefined;
   const testProductsPath = buildForTesting
-    ? (resolvePathFromCwd(params.testProductsPath) ?? createDefaultTestProductsPath('build_sim'))
+    ? (explicitTestProductsPath ??
+      (await prepareManagedTestProductsPath('build_sim')))
     : undefined;
   const sharedBuildParams = testProductsPath
     ? {
@@ -206,50 +216,53 @@ export function createBuildSimExecutor(
   return async (params, ctx) => {
     const resolved = prepared ?? (await prepareBuildSimExecution(params, executor));
 
-    if (resolved.warningMessage) {
-      log('warn', resolved.warningMessage);
-      ctx.emitFragment({
-        kind: 'build-result',
-        fragment: 'warning',
-        message: resolved.warningMessage,
+    const execute = async (): Promise<BuildSimulatorResult> => {
+      if (resolved.warningMessage) {
+        log('warn', resolved.warningMessage);
+        ctx.emitFragment({
+          kind: 'build-result',
+          fragment: 'warning',
+          message: resolved.warningMessage,
+        });
+      }
+
+      const started = createDomainStreamingPipeline('build_sim', 'BUILD', ctx, 'build-result');
+      const buildResult = await executeXcodeBuildCommand(
+        resolved.sharedBuildParams,
+        resolved.platformOptions,
+        params.preferXcodebuild ?? false,
+        resolved.buildAction,
+        executor,
+        undefined,
+        started.pipeline,
+      );
+      const succeeded = !buildResult.isError;
+
+      const xctestrunPaths =
+        succeeded && resolved.testProductsPath
+          ? await findXctestrunPaths(resolved.testProductsPath)
+          : [];
+
+      return createBuildDomainResult({
+        started,
+        succeeded,
+        target: 'simulator',
+        artifacts: {
+          buildLogPath: displayPath(started.pipeline.logPath),
+          ...(succeeded && resolved.testProductsPath
+            ? { testProductsPath: displayPath(resolved.testProductsPath) }
+            : {}),
+          ...(xctestrunPaths.length > 0
+            ? { xctestrunPaths: xctestrunPaths.map(displayPath) }
+            : {}),
+        },
+        fallbackErrorMessages: collectFallbackErrorMessages(started, [], buildResult.content),
+        request: resolved.invocationRequest,
       });
-    }
-
-    const started = createDomainStreamingPipeline('build_sim', 'BUILD', ctx, 'build-result');
-    const buildResult = await executeXcodeBuildCommand(
-      resolved.sharedBuildParams,
-      resolved.platformOptions,
-      params.preferXcodebuild ?? false,
-      resolved.buildAction,
-      executor,
-      undefined,
-      started.pipeline,
-    );
-    const succeeded = !buildResult.isError;
-
-    if (resolved.isManagedTestProductsPath) {
-      markTestProductsPathCompleted(resolved.testProductsPath);
-    }
-
-    const xctestrunPaths =
-      succeeded && resolved.testProductsPath
-        ? await findXctestrunPaths(resolved.testProductsPath)
-        : [];
-
-    return createBuildDomainResult({
-      started,
-      succeeded,
-      target: 'simulator',
-      artifacts: {
-        buildLogPath: displayPath(started.pipeline.logPath),
-        ...(succeeded && resolved.testProductsPath
-          ? { testProductsPath: displayPath(resolved.testProductsPath) }
-          : {}),
-        ...(xctestrunPaths.length > 0 ? { xctestrunPaths: xctestrunPaths.map(displayPath) } : {}),
-      },
-      fallbackErrorMessages: collectFallbackErrorMessages(started, [], buildResult.content),
-      request: resolved.invocationRequest,
-    });
+    };
+    return resolved.isManagedTestProductsPath
+      ? withManagedTestProductsFinalization(resolved.testProductsPath, execute)
+      : execute();
   };
 }
 
@@ -259,38 +272,50 @@ export async function build_simLogic(
 ): Promise<void> {
   const ctx = getHandlerContext();
   const prepared = await prepareBuildSimExecution(params, executor);
+  let executionOwnsFinalization = false;
 
-  ctx.emit(createBuildInvocationFragment('build-result', 'BUILD', prepared.invocationRequest));
-  const executionContext = createStreamingExecutionContext(ctx);
-  const executeBuildSim = createBuildSimExecutor(executor, prepared);
-  const result = await executeBuildSim(params, executionContext);
+  try {
+    ctx.emit(createBuildInvocationFragment('build-result', 'BUILD', prepared.invocationRequest));
+    const executionContext = createStreamingExecutionContext(ctx);
+    const executeBuildSim = createBuildSimExecutor(executor, prepared);
+    executionOwnsFinalization = true;
+    const result = await executeBuildSim(params, executionContext);
 
-  setXcodebuildStructuredOutput(ctx, 'build-result', result, '3');
+    setXcodebuildStructuredOutput(ctx, 'build-result', result, '3');
 
-  if (!result.didError) {
-    if (prepared.testProductsPath) {
-      const nextParams = {
-        testProductsPath: displayPath(prepared.testProductsPath),
-        ...(params.simulatorId
-          ? { simulatorId: params.simulatorId }
-          : { simulatorName: params.simulatorName ?? '' }),
-      };
-      ctx.nextStepParams = { test_sim: nextParams };
-      ctx.nextStepConditionKeys = ['prepared_tests_available'];
-    } else {
-      const nextParams = {
-        ...(params.simulatorId
-          ? { simulatorId: params.simulatorId }
-          : { simulatorName: params.simulatorName ?? '' }),
-        scheme: params.scheme,
-        platform: prepared.detectedPlatform,
-        ...(params.derivedDataPath !== undefined
-          ? { derivedDataPath: params.derivedDataPath }
-          : {}),
-      };
-      ctx.nextStepParams = { get_sim_app_path: nextParams };
-      ctx.nextStepConditionKeys = ['app_build_succeeded'];
+    if (!result.didError) {
+      if (prepared.testProductsPath) {
+        const nextParams = {
+          testProductsPath: displayPath(prepared.testProductsPath),
+          ...(params.simulatorId
+            ? { simulatorId: params.simulatorId }
+            : { simulatorName: params.simulatorName ?? '' }),
+        };
+        ctx.nextStepParams = { test_sim: nextParams };
+        ctx.nextStepConditionKeys = ['prepared_tests_available'];
+      } else {
+        const nextParams = {
+          ...(params.simulatorId
+            ? { simulatorId: params.simulatorId }
+            : { simulatorName: params.simulatorName ?? '' }),
+          scheme: params.scheme,
+          platform: prepared.detectedPlatform,
+          ...(params.derivedDataPath !== undefined
+            ? { derivedDataPath: params.derivedDataPath }
+            : {}),
+        };
+        ctx.nextStepParams = { get_sim_app_path: nextParams };
+        ctx.nextStepConditionKeys = ['app_build_succeeded'];
+      }
     }
+  } catch (error) {
+    if (!executionOwnsFinalization && prepared.isManagedTestProductsPath) {
+      await finalizeManagedTestProductsPathPreservingFailure(
+        prepared.testProductsPath,
+        { error },
+      );
+    }
+    throw error;
   }
 }
 
